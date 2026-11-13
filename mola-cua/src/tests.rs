@@ -1,0 +1,332 @@
+//! Command tests against a scripted device: no adb, no emulator.
+
+use super::*;
+use std::cell::RefCell;
+
+/// Answers adb calls from a script and records every call. The screen is whatever `screen` holds when a dump is asked for.
+struct FakeAdb {
+    devices: String,
+    screen: RefCell<String>,
+    calls: RefCell<Vec<String>>,
+    /// replies for `shell <cmd>` by prefix
+    shell: Vec<(&'static str, &'static str)>,
+    /// when a shell command with this prefix runs, the screen becomes this
+    on: RefCell<Vec<(&'static str, String)>>,
+    serial: Option<String>,
+}
+
+impl FakeAdb {
+    fn new() -> Self {
+        FakeAdb {
+            devices: "List of devices attached\nemulator-5554\tdevice\n".into(),
+            screen: RefCell::new(ui::SAMPLE.to_string()),
+            calls: RefCell::new(Vec::new()),
+            shell: vec![],
+            on: RefCell::new(vec![]),
+            serial: None,
+        }
+    }
+    fn calls(&self) -> Vec<String> {
+        self.calls.borrow().clone()
+    }
+    fn shell_calls(&self) -> Vec<String> {
+        self.calls().into_iter().filter_map(|c| c.strip_prefix("shell ").map(str::to_string)).collect()
+    }
+}
+
+impl Adb for FakeAdb {
+    fn run(&self, args: &[&str]) -> Result<adb::Output, String> {
+        let line = args.join(" ");
+        self.calls.borrow_mut().push(line.clone());
+        let out = |s: &str| Ok(adb::Output { status: 0, stdout: s.as_bytes().to_vec(), stderr: String::new() });
+        if line == "devices" {
+            return out(&self.devices);
+        }
+        if line.starts_with("exec-out uiautomator dump") {
+            return out(&self.screen.borrow());
+        }
+        if let Some(cmd) = line.strip_prefix("shell ") {
+            let next = self.on.borrow().iter().find(|(p, _)| cmd.starts_with(p)).map(|(_, s)| s.clone());
+            if let Some(s) = next {
+                *self.screen.borrow_mut() = s;
+            }
+            return out(self.shell.iter().find(|(p, _)| cmd.starts_with(p)).map(|(_, r)| *r).unwrap_or(""));
+        }
+        out("")
+    }
+    fn describe(&self) -> (String, Option<String>) {
+        ("/fake/adb".into(), self.serial.clone())
+    }
+}
+
+fn app<'a>(adb: &'a FakeAdb, tag: &str) -> App<'a> {
+    let dir = std::env::temp_dir().join(format!("mola-cua-test-{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    App { adb, store: Store::new(dir), tick: Duration::ZERO }
+}
+
+fn refs(v: &Value, out: &mut Vec<(String, String)>) {
+    if let Some(r) = v.get("ref_id").and_then(Value::as_str) {
+        out.push((r.to_string(), v.get("name").and_then(Value::as_str).unwrap_or("").to_string()));
+    }
+    for c in v.get("children").and_then(Value::as_array).into_iter().flatten() {
+        refs(c, out);
+    }
+}
+
+fn ref_of(snapshot: &Value, name: &str) -> String {
+    let mut all = Vec::new();
+    refs(&snapshot["tree"], &mut all);
+    all.into_iter().find(|(_, n)| n == name).unwrap_or_else(|| panic!("no element named {name}")).0
+}
+
+fn code(r: &Res) -> &'static str {
+    r.as_ref().err().map(|f| f.code).unwrap_or("OK")
+}
+
+#[test]
+fn snapshot_gives_qualified_refs_and_the_envelope_matches_agent_desktop() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "snap");
+    let r = a.snapshot(Some("com.example.app"), false, false);
+    let env = envelope("snapshot", &r);
+    assert_eq!((env["version"].as_str(), env["ok"].as_bool(), env["command"].as_str()), (Some("2.6"), Some(true), Some("snapshot")));
+    let d = &env["data"];
+    assert_eq!(d["app"], "com.example.app");
+    assert_eq!(d["device"], "emulator-5554");
+    let id = d["snapshot_id"].as_str().unwrap();
+    let mut all = Vec::new();
+    refs(&d["tree"], &mut all);
+    assert_eq!(all.len() as u64, d["ref_count"].as_u64().unwrap());
+    assert!(all.iter().all(|(r, _)| r.starts_with(&format!("@{id}:e"))), "{all:?}");
+    // parents are numbered before their children
+    assert!(all.iter().map(|(r, _)| r.rsplit('e').next().unwrap().parse::<u32>().unwrap()).is_sorted(), "{all:?}");
+    assert!(!env.to_string().contains("hunter2"), "a password reached the output");
+}
+
+#[test]
+fn interactive_snapshot_drops_plain_text_and_compact_drops_wrappers() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "snap-i");
+    let full = a.snapshot(None, false, false).unwrap();
+    let inter = a.snapshot(None, true, true).unwrap();
+    let (mut f, mut i) = (Vec::new(), Vec::new());
+    refs(&full["tree"], &mut f);
+    refs(&inter["tree"], &mut i);
+    assert!(f.iter().any(|(_, n)| n == "Sign in"));
+    assert!(!i.iter().any(|(_, n)| n == "Sign in"));
+    assert!(i.iter().any(|(_, n)| n == "Log in"));
+    assert!(i.len() < f.len());
+}
+
+#[test]
+fn snapshot_of_an_app_that_is_not_in_front_names_what_is() {
+    let adb = FakeAdb::new();
+    let r = app(&adb, "front").snapshot(Some("com.other"), false, false);
+    let f = r.as_ref().err().unwrap();
+    assert_eq!(f.code, "APP_NOT_FOUND");
+    assert_eq!(f.details.as_ref().unwrap()["foreground"], "com.example.app");
+}
+
+#[test]
+fn click_taps_the_centre_of_where_the_element_is_now() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "click");
+    let login = ref_of(&a.snapshot(None, true, false).unwrap(), "Log in");
+    // the button moved 100 px down since the snapshot
+    *adb.screen.borrow_mut() = ui::SAMPLE.replace("[40,700][1040,820]", "[40,800][1040,920]");
+    let r = a.click(&login).unwrap();
+    assert_eq!(r["tapped"], json!({"x": 540, "y": 860}));
+    assert_eq!(adb.shell_calls(), vec!["input tap 540 860"]);
+}
+
+#[test]
+fn a_ref_whose_element_is_gone_is_stale_and_nothing_is_tapped() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "stale");
+    let login = ref_of(&a.snapshot(None, true, false).unwrap(), "Log in");
+    *adb.screen.borrow_mut() = ui::SAMPLE.replace("text=\"Log in\"", "text=\"Loading\"");
+    let r = a.click(&login);
+    assert_eq!(code(&r), "STALE_REF");
+    assert!(adb.shell_calls().is_empty());
+    let env = envelope("click", &r);
+    assert_eq!(env["error"]["disposition"], json!({"delivery": "not_delivered", "retry": "safe"}));
+}
+
+#[test]
+fn bad_and_unknown_refs_are_told_apart() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "refs");
+    assert_eq!(code(&a.click("e8")), "INVALID_ARGS");
+    assert_eq!(code(&a.click("@../../etc:e1")), "INVALID_ARGS");
+    assert_eq!(code(&a.click("@snever:e1")), "SNAPSHOT_NOT_FOUND");
+    let login = ref_of(&a.snapshot(None, true, false).unwrap(), "Log in");
+    let other = format!("{}:e999", login.split(':').next().unwrap());
+    assert_eq!(code(&a.click(&other)), "ELEMENT_NOT_FOUND");
+}
+
+#[test]
+fn set_value_clears_types_and_reads_the_field_back() {
+    let adb = FakeAdb::new();
+    adb.on.borrow_mut().push(("input text", ui::SAMPLE.replace("text=\"ada\"", "text=\"it's me\"")));
+    let a = app(&adb, "setv");
+    let user = a.find(None, None, None, Some("user"), true, false).unwrap()["match"]["ref_id"].as_str().unwrap().to_string();
+    let r = a.set_value(&user, "it's me").unwrap();
+    assert_eq!((r["verified"].as_bool(), r["value"].as_str()), (Some(true), Some("it's me")));
+    assert_eq!(adb.shell_calls(), vec!["input tap 540 400", "input keycombination 113 29", "input keyevent 67", r"input text 'it'\''s%sme'"]);
+}
+
+#[test]
+fn set_value_fails_when_the_field_does_not_hold_the_text_and_says_input_was_sent() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "setv-bad");
+    let user = a.find(None, None, None, Some("com.example.app:id/user"), true, false).unwrap()["match"]["ref_id"].as_str().unwrap().to_string();
+    let r = a.set_value(&user, "grace");
+    assert_eq!(code(&r), "ACTION_FAILED");
+    let env = envelope("set-value", &r);
+    assert_eq!(env["error"]["disposition"]["retry"], "unsafe");
+    assert_eq!(env["error"]["details"], json!({"expected": "grace", "found": "ada"}));
+}
+
+#[test]
+fn set_value_refuses_what_adb_cannot_type_and_what_is_not_a_field() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "setv-no");
+    let snap = a.snapshot(None, true, false).unwrap();
+    let user = a.find(None, None, None, Some("user"), true, false).unwrap()["match"]["ref_id"].as_str().unwrap().to_string();
+    assert_eq!(code(&a.set_value(&user, "你好")), "ACTION_NOT_SUPPORTED");
+    assert_eq!(code(&a.set_value(&ref_of(&snap, "Log in"), "x")), "ACTION_NOT_SUPPORTED");
+    assert!(adb.shell_calls().is_empty());
+}
+
+#[test]
+fn a_password_field_is_typed_but_reported_as_not_verified() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "pass");
+    let pass = a.find(None, None, None, Some("pass"), true, false).unwrap()["match"]["ref_id"].as_str().unwrap().to_string();
+    let r = a.set_value(&pass, "s3cret").unwrap();
+    assert_eq!(r["verified"], false);
+    assert!(!r.to_string().contains("s3cret") && !r.to_string().contains("hunter2"));
+}
+
+#[test]
+fn find_filters_counts_and_does_not_search_password_content() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "find");
+    assert_eq!(a.find(Some("button"), None, None, None, false, true).unwrap()["count"], 1);
+    assert_eq!(a.find(None, Some("Row"), None, None, false, false).unwrap()["count"], 2);
+    assert_eq!(a.find(None, None, Some("ad"), None, false, true).unwrap()["count"], 1);
+    assert_eq!(a.find(None, None, Some("hunter"), None, false, true).unwrap()["count"], 0);
+    assert!(a.find(None, Some("Nope"), None, None, true, false).unwrap()["match"].is_null());
+    assert_eq!(code(&a.find(None, None, None, None, false, false)), "INVALID_ARGS");
+}
+
+#[test]
+fn get_and_is_read_the_live_element() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "get");
+    let user = a.find(None, None, None, Some("user"), true, false).unwrap()["match"]["ref_id"].as_str().unwrap().to_string();
+    *adb.screen.borrow_mut() = ui::SAMPLE.replace("text=\"ada\"", "text=\"grace\"");
+    let get = |p: &str| a.run(&Cmd::Get { r#ref: user.clone(), property: p.into() });
+    assert_eq!(get("text").unwrap()["value"], "grace");
+    assert_eq!(get("role").unwrap()["value"], "textfield");
+    assert_eq!(code(&get("colour")), "INVALID_ARGS");
+    let is = a.run(&Cmd::Is { r#ref: user.clone(), property: "focused".into() }).unwrap();
+    assert_eq!(is["result"], true);
+}
+
+#[test]
+fn several_devices_need_a_choice_and_an_unauthorized_one_is_not_ready() {
+    let mut adb = FakeAdb::new();
+    adb.devices = "List of devices attached\nemulator-5554\tdevice\nR58M\tdevice\n".into();
+    let r = app(&adb, "multi").snapshot(None, false, false);
+    assert_eq!(code(&r), "AMBIGUOUS_TARGET");
+    assert_eq!(r.as_ref().err().unwrap().details.as_ref().unwrap()["candidates"], json!(["emulator-5554", "R58M"]));
+    adb.serial = Some("R58M".into());
+    assert!(app(&adb, "multi2").snapshot(None, false, false).is_ok());
+    adb.devices = "List of devices attached\nR58M\tunauthorized\n".into();
+    assert_eq!(code(&app(&adb, "multi3").snapshot(None, false, false)), "PERM_DENIED");
+    adb.serial = None;
+    assert_eq!(code(&app(&adb, "multi4").snapshot(None, false, false)), "WINDOW_NOT_FOUND");
+}
+
+#[test]
+fn a_ref_from_another_device_is_stale() {
+    let mut adb = FakeAdb::new();
+    let a = app(&adb, "dev");
+    let login = ref_of(&a.snapshot(None, true, false).unwrap(), "Log in");
+    let dir = a.store.dir.parent().unwrap().to_path_buf();
+    adb.devices = "List of devices attached\nOTHER\tdevice\n".into();
+    let b = App { adb: &adb, store: Store::new(dir), tick: Duration::ZERO };
+    assert_eq!(code(&b.click(&login)), "STALE_REF");
+}
+
+#[test]
+fn launch_resolves_the_activity_and_requires_status_ok() {
+    let mut adb = FakeAdb::new();
+    adb.shell = vec![("cmd package resolve-activity", "priority=0 preferredOrder=0\ncom.example.app/.MainActivity\n"), ("am start", "Starting: Intent\nStatus: ok\nLaunchState: COLD\nTotalTime: 412\nComplete\n")];
+    let r = app(&adb, "launch").launch("com.example.app").unwrap();
+    assert_eq!((r["component"].as_str(), r["launch_ms"].as_u64()), (Some("com.example.app/.MainActivity"), Some(412)));
+    assert_eq!(adb.shell_calls()[1], "am start -W -n 'com.example.app/.MainActivity'");
+
+    adb.shell = vec![("cmd package resolve-activity", "No activity found\n")];
+    assert_eq!(code(&app(&adb, "launch2").launch("com.missing")), "APP_NOT_FOUND");
+    adb.shell = vec![("am start", "Error type 3\nError: Activity class {x/y} does not exist.\n")];
+    let r = app(&adb, "launch3").launch("x/y");
+    assert_eq!(code(&r), "ACTION_FAILED");
+    assert!(r.as_ref().err().unwrap().message.contains("does not exist"));
+}
+
+#[test]
+fn wait_returns_when_the_condition_holds_and_times_out_with_what_is_in_front() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "wait");
+    assert_eq!(a.wait(Some("Sign in"), None, false, 1000).unwrap()["condition"], "present");
+    assert_eq!(a.wait(Some("Welcome"), None, true, 1000).unwrap()["condition"], "gone");
+    let r = a.wait(Some("Welcome"), None, false, 0);
+    assert_eq!(code(&r), "TIMEOUT");
+    assert_eq!(r.as_ref().err().unwrap().details.as_ref().unwrap()["foreground"], "com.example.app");
+    assert_eq!(code(&a.wait(None, None, false, 0)), "INVALID_ARGS");
+}
+
+#[test]
+fn a_device_that_gives_no_tree_is_reported_after_three_tries() {
+    let adb = FakeAdb::new();
+    *adb.screen.borrow_mut() = "ERROR: could not get idle state.\n".into();
+    let r = app(&adb, "idle").snapshot(None, false, false);
+    assert_eq!(code(&r), "APP_UNRESPONSIVE");
+    assert_eq!(adb.calls().iter().filter(|c| c.starts_with("exec-out uiautomator")).count(), 3);
+}
+
+#[test]
+fn health_reports_running_and_crash_lines_for_the_package_only() {
+    struct Crashy(FakeAdb);
+    impl Adb for Crashy {
+        fn run(&self, args: &[&str]) -> Result<adb::Output, String> {
+            if args.starts_with(&["logcat", "-d"]) {
+                return Ok(adb::Output { status: 0, stdout: b"E AndroidRuntime: Process: com.example.app, PID: 77\nE AndroidRuntime: Process: com.other, PID: 9\n".to_vec(), stderr: String::new() });
+            }
+            self.0.run(args)
+        }
+        fn describe(&self) -> (String, Option<String>) {
+            self.0.describe()
+        }
+    }
+    let mut fake = FakeAdb::new();
+    fake.shell = vec![("pidof", "4242\n")];
+    let adb = Crashy(fake);
+    let dir = std::env::temp_dir().join(format!("mola-cua-test-{}-health", std::process::id()));
+    let a = App { adb: &adb, store: Store::new(dir), tick: Duration::ZERO };
+    let r = a.health("com.example.app", false).unwrap();
+    assert_eq!((r["running"].as_bool(), r["crashed"].as_bool(), r["crash_lines"].as_array().unwrap().len()), (Some(true), Some(true), 1));
+}
+
+#[test]
+fn press_maps_names_to_keycodes() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "press");
+    a.run(&Cmd::Press { key: "Back".into() }).unwrap();
+    a.run(&Cmd::Press { key: "66".into() }).unwrap();
+    assert_eq!(adb.shell_calls(), vec!["input keyevent 4", "input keyevent 66"]);
+    assert_eq!(code(&a.run(&Cmd::Press { key: "banana".into() })), "INVALID_ARGS");
+}

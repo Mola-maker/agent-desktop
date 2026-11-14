@@ -10,6 +10,8 @@ pub struct UiNode {
     pub text: String,
     pub resource_id: String,
     pub content_desc: String,
+    /// placeholder of a text field; uiautomator also reports it as `text` while the field is empty
+    pub hint: String,
     /// left, top, right, bottom in device pixels
     pub bounds: (i32, i32, i32, i32),
     pub clickable: bool,
@@ -62,6 +64,7 @@ fn read_node(n: roxmltree::Node, path: Vec<u32>) -> UiNode {
         text: s("text"),
         resource_id: s("resource-id"),
         content_desc: s("content-desc"),
+        hint: s("hint"),
         bounds: parse_bounds(n.attribute("bounds").unwrap_or("")),
         clickable: b("clickable"),
         long_clickable: b("long-clickable"),
@@ -122,10 +125,29 @@ impl UiNode {
         self.clickable || self.long_clickable || self.checkable || self.scrollable || self.is_textfield()
     }
 
+    /// What the user typed into a text field: empty while only the placeholder shows.
+    pub fn content(&self) -> &str {
+        if !self.hint.is_empty() && self.text == self.hint { "" } else { &self.text }
+    }
+
+    /// The element's own name, or for an unnamed thing you can act on (a clickable row), the first texts inside it.
+    pub fn label(&self) -> Option<String> {
+        if let Some(n) = self.name() {
+            return Some(n);
+        }
+        if !self.interactive() || self.scrollable {
+            return None;
+        }
+        let mut all = Vec::new();
+        self.walk(&mut all);
+        let texts: Vec<String> = all.iter().skip(1).filter(|c| !c.is_textfield()).filter_map(|c| c.name()).take(2).collect();
+        (!texts.is_empty()).then(|| texts.join(" · "))
+    }
+
     /// What a person reads on the element. A password field never yields its content.
     pub fn name(&self) -> Option<String> {
         if self.is_textfield() {
-            return (!self.content_desc.is_empty()).then(|| self.content_desc.clone());
+            return [&self.content_desc, &self.hint].into_iter().find(|s| !s.is_empty()).cloned();
         }
         if !self.text.is_empty() && !self.password {
             Some(self.text.clone())
@@ -140,7 +162,7 @@ impl UiNode {
         if !self.is_textfield() {
             return None;
         }
-        Some(if self.password { "•".repeat(self.text.chars().count()) } else { self.text.clone() })
+        Some(if self.password { "•".repeat(self.content().chars().count()) } else { self.content().to_string() })
     }
 
     pub fn visible(&self) -> bool {
@@ -195,7 +217,7 @@ impl UiNode {
         let mut m = Map::new();
         if let Some(r) = ref_id { m.insert("ref_id".into(), json!(r)); }
         m.insert("role".into(), json!(self.role()));
-        if let Some(n) = self.name() { m.insert("name".into(), json!(n)); }
+        if let Some(n) = self.label() { m.insert("name".into(), json!(n)); }
         if let Some(v) = self.value() { m.insert("value".into(), json!(v)); }
         if !self.resource_id.is_empty() { m.insert("resource_id".into(), json!(self.resource_id)); }
         let st = self.states();
@@ -294,6 +316,28 @@ mod tests {
         let gone = parse_dump(&SAMPLE.replace("text=\"Log in\"", "text=\"Loading\"")).unwrap();
         let login = all(&root).into_iter().find(|n| n.text == "Log in").unwrap().identity();
         assert_eq!(resolve(&gone, &login), Ok(None));
+    }
+
+    #[test]
+    fn an_empty_field_reports_its_placeholder_as_name_not_as_content() {
+        let xml = SAMPLE.replace("text=\"ada\" resource-id=\"com.example.app:id/user\"", "text=\"Search settings\" hint=\"Search settings\" resource-id=\"com.example.app:id/user\"").replace("content-desc=\"User name\"", "content-desc=\"\"");
+        let root = parse_dump(&xml).unwrap();
+        let f = all(&root).into_iter().find(|n| n.resource_id.ends_with("/user")).unwrap();
+        assert_eq!((f.content(), f.value().unwrap().as_str(), f.name().unwrap().as_str()), ("", "", "Search settings"));
+        let typed = parse_dump(&xml.replace("text=\"Search settings\" hint", "text=\"wifi\" hint")).unwrap();
+        let f = all(&typed).into_iter().find(|n| n.resource_id.ends_with("/user")).unwrap();
+        assert_eq!(f.value().unwrap(), "wifi");
+    }
+
+    #[test]
+    fn a_clickable_row_without_a_name_is_labelled_by_the_texts_inside_it() {
+        let xml = r#"<hierarchy rotation="0"><node class="android.widget.LinearLayout" package="p" text="" resource-id="" content-desc="" clickable="true" enabled="true" bounds="[0,0][100,100]"><node class="android.widget.TextView" package="p" text="Network &amp; internet" resource-id="android:id/title" content-desc="" enabled="true" bounds="[0,0][100,40]" /><node class="android.widget.TextView" package="p" text="Mobile, Wi-Fi, hotspot" resource-id="android:id/summary" content-desc="" enabled="true" bounds="[0,40][100,80]" /><node class="android.widget.TextView" package="p" text="third" resource-id="" content-desc="" enabled="true" bounds="[0,80][100,100]" /></node></hierarchy>"#;
+        let root = parse_dump(xml).unwrap();
+        let row = &root.children[0];
+        assert_eq!(row.name(), None);
+        assert_eq!(row.label().unwrap(), "Network & internet · Mobile, Wi-Fi, hotspot");
+        assert_eq!(row.to_json(None)["name"], "Network & internet · Mobile, Wi-Fi, hotspot");
+        assert_eq!(root.label(), None);
     }
 
     #[test]

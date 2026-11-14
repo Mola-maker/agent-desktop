@@ -1,6 +1,10 @@
 //! mola-cua: computer use on Android over adb, in agent-desktop's snapshot / ref / envelope model.
 //! Commands this binary does not know are handed to `agent-desktop`, so one entry point covers desktop and Android.
 
+// An error carries its details as JSON so it can be printed as agent-desktop prints it; errors are rare and
+// built once per command, so their size is not worth boxing every call site for.
+#![allow(clippy::result_large_err)]
+
 mod adb;
 mod ui;
 
@@ -362,10 +366,10 @@ impl App<'_> {
         if after.password {
             return Ok(json!({"ref_id": r, "action": "set-value", "verified": false, "reason": "password fields do not expose their content"}));
         }
-        if after.text != text {
-            return Err(Fail::new(E::ActionFailed, "the field does not hold the text that was typed").details(json!({"expected": text, "found": after.text})).after_input());
+        if after.content() != text {
+            return Err(Fail::new(E::ActionFailed, "the field does not hold the text that was typed").details(json!({"expected": text, "found": after.content()})).after_input());
         }
-        Ok(json!({"ref_id": r, "action": "set-value", "verified": true, "value": after.text}))
+        Ok(json!({"ref_id": r, "action": "set-value", "verified": true, "value": after.content()}))
     }
 
     fn wait(&self, text: Option<&str>, rid: Option<&str>, gone: bool, timeout_ms: u64) -> Res {
@@ -531,8 +535,8 @@ fn quote(s: &str) -> String {
 
 fn matches(n: &UiNode, role: Option<&str>, name: Option<&str>, text: Option<&str>, rid: Option<&str>) -> bool {
     role.is_none_or(|r| n.role() == r)
-        && name.is_none_or(|x| n.name().as_deref() == Some(x))
-        && text.is_none_or(|x| n.name().is_some_and(|v| v.contains(x)) || (!n.password && n.is_textfield() && n.text.contains(x)))
+        && name.is_none_or(|x| n.label().as_deref() == Some(x))
+        && text.is_none_or(|x| n.label().is_some_and(|v| v.contains(x)) || (!n.password && n.is_textfield() && n.content().contains(x)))
         && rid.is_none_or(|x| n.resource_id == x || n.resource_id.rsplit_once(":id/").is_some_and(|(_, tail)| tail == x))
 }
 

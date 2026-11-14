@@ -36,6 +36,12 @@ mola-cua snapshot --app Finder -i         # not an Android command: goes to agen
 - State is kept in `~/.mola-cua/snapshots` (the last 40 snapshots); set `MOLA_CUA_HOME` to move it.
 - Screenshots and snapshots can hold private content. Keep them local.
 
+## What has been run on a device
+
+On an Android 16 emulator (API 36.1, headless, 2026-11-13): `status`, `health --clear`, `launch` (activity resolved, `Status: ok`), `snapshot -i --compact`, `find`, `click` into a sub-screen, `wait`, a ref from the previous screen refused as `STALE_REF`, `press back`, `health`, `screenshot`, `close-app`, and `launch` of a package that is not installed (`APP_NOT_FOUND`). A dump took 2 to 7 s on that emulator, which was short of memory.
+
+Not confirmed on a device: `set-value` putting text into a field. On that emulator typed text never appeared in the search field, with this tool or with plain `adb shell input text`, and the screen could not be inspected because the headless renderer produced a blank screenshot. The command reported the failure (`ACTION_FAILED`, expected and found) instead of claiming success. `install` has not been run with a real APK.
+
 ## Tests
 
 `cargo test` runs against a scripted device (no adb, no emulator).

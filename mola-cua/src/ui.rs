@@ -194,7 +194,8 @@ impl UiNode {
             // A text field's content changes as it is used; it is not part of what the element is.
             text: if self.is_textfield() || self.password { String::new() } else { self.text.clone() },
             hint: self.hint.clone(),
-            label: if self.name().is_none() { self.label().unwrap_or_default() } else { String::new() },
+            // The first text only: a row's second line (a status, a count, a time) changes while the row stays the row.
+            label: if self.name().is_none() { self.label().map(|l| l.split(" · ").next().unwrap_or("").to_string()).unwrap_or_default() } else { String::new() },
             path: self.path.clone(),
         }
     }

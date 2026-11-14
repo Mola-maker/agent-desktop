@@ -348,7 +348,9 @@ impl App<'_> {
         root.walk(&mut all);
         let all_hits: Vec<&UiNode> = all.into_iter().filter(|n| n.visible() && matches(n, role, name, text, rid)).collect();
         // A nameless row matches through the text inside it. When that text matched too, they are one hit: keep the text.
-        let borrowed = |n: &UiNode| n.name().is_none() && all_hits.iter().any(|h| h.path.len() > n.path.len() && h.path.starts_with(&n.path));
+        // Only then: a search by role alone must still return the row itself.
+        let by_words = name.is_some() || text.is_some();
+        let borrowed = |n: &UiNode| by_words && n.name().is_none() && all_hits.iter().any(|h| h.name().is_some() && h.path.len() > n.path.len() && h.path.starts_with(&n.path));
         let hits: Vec<&UiNode> = all_hits.iter().copied().filter(|n| !borrowed(n)).collect();
         if count {
             return Ok(json!({"count": hits.len()}));
@@ -397,7 +399,8 @@ impl App<'_> {
             // The first step may not have landed; once it has, a later failure leaves the field half changed.
             let out = self.shell(step).map_err(|f| if i == 0 { f.maybe_sent() } else { f.after_input() })?;
             if !out.ok() {
-                return Err(Fail::new(E::ActionFailed, format!("`{}` failed: {}", step.split(' ').take(2).collect::<Vec<_>>().join(" "), out.stderr.trim())).after_input());
+                // Name the step and its exit status only: the device's own message could repeat what was typed.
+                return Err(Fail::new(E::ActionFailed, format!("`{}` failed with exit {}", step.split(' ').take(2).collect::<Vec<_>>().join(" "), out.status)).after_input());
             }
         }
         // The field itself is the evidence. A password field cannot be read back, so say that instead of claiming success.
@@ -463,7 +466,8 @@ impl App<'_> {
                 None => return Err(Fail::new(E::AppNotFound, format!("{app} has no launchable activity or is not installed")).hint("mola-cua install <apk>")),
             }
         };
-        let out = self.shell(&format!("am start -W -n {}", quote(&component)))?;
+        // Starting an app changes the device: if adb does not come back, it may have started.
+        let out = self.send(&format!("am start -W -n {}", quote(&component)))?;
         let t = out.text();
         if !t.contains("Status: ok") {
             // `am` prints "Error type 3" and then the sentence that says what is wrong; prefer the sentence.
@@ -505,7 +509,7 @@ impl App<'_> {
                     return Err(Fail::new(E::InvalidArgs, format!("{} is not a file", apk.display())));
                 }
                 self.serial()?;
-                let out = self.adb(&["install", "-r", &apk.to_string_lossy()])?;
+                let out = self.adb(&["install", "-r", &apk.to_string_lossy()]).map_err(Fail::maybe_sent)?;
                 let t = format!("{}{}", out.text(), out.stderr);
                 // the word on a line of its own, and a clean exit: a path such as SuccessStory.apk in an error is not success
                 if !(out.ok() && out.text().lines().any(|l| l.trim() == "Success")) {
@@ -516,7 +520,7 @@ impl App<'_> {
             Cmd::Launch { app } => self.launch(app),
             Cmd::CloseApp { package } => {
                 self.serial()?;
-                self.shell(&format!("am force-stop {}", quote(package)))?;
+                self.send(&format!("am force-stop {}", quote(package)))?;
                 Ok(json!({"package": package, "stopped": true}))
             }
             Cmd::Health { package, clear } => self.health(package, *clear),

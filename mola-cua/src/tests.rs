@@ -509,3 +509,59 @@ fn agent_desktop_is_resolved_to_an_executable_never_to_a_launcher_script() {
         assert_eq!(agent_desktop(&on_path).unwrap(), dir.join("agent-desktop"));
     }
 }
+
+// ---------------------------------------------------------------- review round 2
+
+#[test]
+fn launch_install_and_close_that_do_not_come_back_are_uncertain_not_safe_to_retry() {
+    let apk = std::env::temp_dir().join("mola-cua-tests").join(format!("{}-big.apk", std::process::id()));
+    std::fs::create_dir_all(apk.parent().unwrap()).unwrap();
+    std::fs::write(&apk, b"x").unwrap();
+    for (hang, cmd) in [
+        ("shell am start", Cmd::Launch { app: "com.example.app/.Main".into() }),
+        ("install", Cmd::Install { apk: apk.clone() }),
+        ("shell am force-stop", Cmd::CloseApp { package: "com.example.app".into() }),
+    ] {
+        let mut adb = FakeAdb::new();
+        adb.hangs_on = Some(hang);
+        let r = app(&adb, "hang-dev").run(&cmd);
+        assert_eq!(code(&r), "TIMEOUT", "{hang}");
+        assert_eq!(disposition(&r).0, "delivery_uncertain", "{hang}");
+        assert!(envelope("x", &r)["error"].get("recovery").is_none(), "{hang}");
+    }
+}
+
+#[test]
+fn find_by_role_alone_returns_the_row_itself_even_when_a_wrapper_inside_it_has_the_same_role() {
+    let adb = FakeAdb::new();
+    *adb.screen.borrow_mut() = "<hierarchy rotation=\"0\"><node class=\"android.widget.LinearLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" clickable=\"true\" enabled=\"true\" bounds=\"[0,0][100,100]\"><node class=\"android.widget.LinearLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,100]\"><node class=\"android.widget.TextView\" package=\"p\" text=\"Alpha\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,50]\" /></node></node></hierarchy>".into();
+    let a = app(&adb, "role");
+    let found = a.find(Some("group"), None, None, None, false, false).unwrap();
+    let rows: Vec<&Value> = found["matches"].as_array().unwrap().iter().filter(|m| m["name"] == "Alpha").collect();
+    assert_eq!(rows.len(), 1, "{found}");
+    assert_eq!(rows[0]["available_actions"], json!(["Click"]));
+    // by words, the row and the text that names it are still one hit
+    assert_eq!(a.find(None, None, Some("Alpha"), None, false, true).unwrap()["count"], 1);
+}
+
+#[test]
+fn a_row_keeps_its_ref_when_only_its_second_line_changes() {
+    let screen = |summary: &str| format!("<hierarchy rotation=\"0\"><node class=\"android.widget.LinearLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" clickable=\"true\" enabled=\"true\" bounds=\"[0,0][100,100]\"><node class=\"android.widget.TextView\" package=\"p\" text=\"Wi-Fi\" resource-id=\"android:id/title\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,50]\" /><node class=\"android.widget.TextView\" package=\"p\" text=\"{summary}\" resource-id=\"android:id/summary\" content-desc=\"\" enabled=\"true\" bounds=\"[0,50][100,100]\" /></node></hierarchy>");
+    let adb = FakeAdb::new();
+    *adb.screen.borrow_mut() = screen("Connected");
+    let a = app(&adb, "summary");
+    let row = ref_of(&a.snapshot(None, true, false).unwrap(), "Wi-Fi · Connected");
+    *adb.screen.borrow_mut() = screen("Disconnected");
+    assert_eq!(a.click(&row).unwrap()["tapped"], json!({"x": 50, "y": 50}));
+}
+
+#[test]
+fn a_failed_typing_step_does_not_repeat_the_device_message() {
+    let mut adb = FakeAdb::new();
+    adb.exits = vec![("shell input text", 1, "")];
+    let a = app(&adb, "echo");
+    let user = a.find(None, None, None, Some("user"), true, false).unwrap()["match"]["ref_id"].as_str().unwrap().to_string();
+    let r = a.set_value(&user, "s3cret");
+    assert_eq!(code(&r), "ACTION_FAILED");
+    assert_eq!(r.as_ref().err().unwrap().message, "`input text` failed with exit 1");
+}

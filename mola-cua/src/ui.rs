@@ -35,7 +35,20 @@ pub struct Identity {
     pub resource_id: String,
     pub content_desc: String,
     pub text: String,
+    /// placeholder of a text field: what tells one unnamed field from another
+    #[serde(default)]
+    pub hint: String,
+    /// the label a nameless container borrows from the texts inside it: what tells one list row from another
+    #[serde(default)]
+    pub label: String,
     pub path: Vec<u32>,
+}
+
+impl Identity {
+    /// Does anything besides the class and the position say which element this is?
+    fn anchored(&self) -> bool {
+        [&self.resource_id, &self.content_desc, &self.text, &self.hint, &self.label].into_iter().any(|s| !s.is_empty())
+    }
 }
 
 /// `uiautomator dump /dev/tty` prints the XML and then "UI hierchary dumped to: /dev/tty" on the same stream.
@@ -180,6 +193,8 @@ impl UiNode {
             content_desc: self.content_desc.clone(),
             // A text field's content changes as it is used; it is not part of what the element is.
             text: if self.is_textfield() || self.password { String::new() } else { self.text.clone() },
+            hint: self.hint.clone(),
+            label: if self.name().is_none() { self.label().unwrap_or_default() } else { String::new() },
             path: self.path.clone(),
         }
     }
@@ -240,11 +255,13 @@ pub fn resolve<'a>(root: &'a UiNode, id: &Identity) -> Result<Option<&'a UiNode>
     root.walk(&mut all);
     let same = |n: &&UiNode| {
         let i = n.identity();
-        i.class == id.class && i.resource_id == id.resource_id && i.content_desc == id.content_desc && i.text == id.text
+        i.class == id.class && i.resource_id == id.resource_id && i.content_desc == id.content_desc && i.text == id.text && i.hint == id.hint && i.label == id.label
     };
     let hits: Vec<&UiNode> = all.into_iter().filter(same).collect();
     match hits.len() {
         0 => Ok(None),
+        // An element with nothing but a class is only itself in the same place: elsewhere it is some other element.
+        1 if !id.anchored() && hits[0].path != id.path => Ok(None),
         1 => Ok(Some(hits[0])),
         n => match hits.iter().find(|h| h.path == id.path) {
             // Several twins (list rows): the one in the same place is the one the ref meant.
@@ -338,6 +355,54 @@ mod tests {
         assert_eq!(row.label().unwrap(), "Network & internet · Mobile, Wi-Fi, hotspot");
         assert_eq!(row.to_json(None)["name"], "Network & internet · Mobile, Wi-Fi, hotspot");
         assert_eq!(root.label(), None);
+    }
+
+    #[test]
+    fn a_row_ref_is_stale_when_another_row_sits_in_its_place() {
+        let row = |t: &str, y: i32| {
+            format!(
+                "<node class=\"android.widget.LinearLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" clickable=\"true\" enabled=\"true\" bounds=\"[0,{y}][100,{}]\"><node class=\"android.widget.TextView\" package=\"p\" text=\"{t}\" resource-id=\"android:id/title\" content-desc=\"\" enabled=\"true\" bounds=\"[0,{y}][100,{}]\" /></node>",
+                y + 100,
+                y + 50
+            )
+        };
+        let screen = |a: &str, b: &str| {
+            format!(
+                "<hierarchy rotation=\"0\"><node class=\"android.widget.ListView\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,200]\">{}{}</node></hierarchy>",
+                row(a, 0),
+                row(b, 100)
+            )
+        };
+        let before = parse_dump(&screen("Alpha", "Beta")).unwrap();
+        let alpha = before.children[0].children[0].identity();
+        assert_eq!(alpha.label, "Alpha");
+        let scrolled = parse_dump(&screen("Gamma", "Delta")).unwrap();
+        assert_eq!(resolve(&scrolled, &alpha), Ok(None), "the ref for Alpha resolved to the row now in its place");
+        let moved = parse_dump(&screen("Zed", "Alpha")).unwrap();
+        assert_eq!(resolve(&moved, &alpha).unwrap().unwrap().bounds.1, 100, "Alpha moved down and is still Alpha");
+    }
+
+    #[test]
+    fn an_unnamed_field_is_not_some_other_unnamed_field() {
+        let field = |hint: &str| {
+            format!(
+                "<hierarchy rotation=\"0\"><node class=\"android.widget.FrameLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,300]\"><node class=\"android.widget.EditText\" package=\"p\" text=\"{hint}\" hint=\"{hint}\" resource-id=\"\" content-desc=\"\" clickable=\"true\" enabled=\"true\" bounds=\"[0,200][100,300]\" /></node></hierarchy>"
+            )
+        };
+        let login = parse_dump(&field("Username")).unwrap();
+        let user = login.children[0].children[0].identity();
+        assert_eq!(resolve(&parse_dump(&field("Search")).unwrap(), &user), Ok(None));
+        // no hint, no id, no description: only the same place counts
+        let bare = |extra: &str| {
+            format!(
+                "<hierarchy rotation=\"0\"><node class=\"android.widget.FrameLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,300]\">{extra}<node class=\"android.widget.EditText\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" clickable=\"true\" enabled=\"true\" bounds=\"[0,200][100,300]\" /></node></hierarchy>"
+            )
+        };
+        let a = parse_dump(&bare("")).unwrap();
+        let id = a.children[0].children[0].identity();
+        assert!(resolve(&a, &id).unwrap().is_some());
+        let shifted = parse_dump(&bare("<node class=\"android.widget.ImageView\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,100]\" />")).unwrap();
+        assert_eq!(resolve(&shifted, &id), Ok(None));
     }
 
     #[test]

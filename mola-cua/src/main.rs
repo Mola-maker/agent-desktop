@@ -9,7 +9,7 @@ mod adb;
 mod ui;
 
 use adb::{Adb, RealAdb, locate_adb, parse_devices};
-use agent_desktop_core::response::output::ENVELOPE_VERSION;
+use agent_desktop_core::{DeliverySemantics, ErrorPayload, RecoveryHint, Response};
 use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -97,7 +97,7 @@ enum Cmd {
     SetValue {
         r#ref: String,
         text: Option<String>,
-        /// Read the text from stdin (keeps it out of the process list)
+        /// Read the text from stdin (keeps it out of this command's arguments and your shell history; adb still receives it as an argument)
         #[arg(long)]
         stdin: bool,
     },
@@ -121,19 +121,31 @@ enum Cmd {
     Desktop(Vec<String>),
 }
 
-/// An error in agent-desktop's shape. `delivered` says whether input may have reached the device.
+/// Did input reach the device? `Maybe` is for a call that sends input and did not come back (a timeout).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Sent {
+    No,
+    Maybe,
+    Yes,
+}
+
+/// An error, printed through agent-desktop-core's own `ErrorPayload` so both tools emit one shape.
 #[derive(Debug)]
 struct Fail {
     code: &'static str,
     message: String,
     suggestion: Option<String>,
     details: Option<Value>,
-    delivered: bool,
+    sent: Sent,
 }
 
 impl Fail {
     fn new(code: agent_desktop_core::ErrorCode, message: impl Into<String>) -> Self {
-        Fail { code: code.as_str(), message: message.into(), suggestion: None, details: None, delivered: false }
+        Fail { code: code.as_str(), message: message.into(), suggestion: None, details: None, sent: Sent::No }
+    }
+    fn maybe_sent(mut self) -> Self {
+        self.sent = Sent::Maybe;
+        self
     }
     fn hint(mut self, s: impl Into<String>) -> Self {
         self.suggestion = Some(s.into());
@@ -144,7 +156,7 @@ impl Fail {
         self
     }
     fn after_input(mut self) -> Self {
-        self.delivered = true;
+        self.sent = Sent::Yes;
         self
     }
 }
@@ -152,17 +164,35 @@ impl Fail {
 use agent_desktop_core::ErrorCode as E;
 type Res = Result<Value, Fail>;
 
-fn envelope(command: &str, r: &Res) -> Value {
-    match r {
-        Ok(data) => json!({"version": ENVELOPE_VERSION, "ok": true, "command": command, "data": data}),
-        Err(f) => {
-            let mut e = json!({"code": f.code, "message": f.message,
-                "disposition": {"delivery": if f.delivered { "delivered" } else { "not_delivered" }, "retry": if f.delivered { "unsafe" } else { "safe" }}});
-            if let Some(s) = &f.suggestion { e["suggestion"] = json!(s); }
-            if let Some(d) = &f.details { e["details"] = d.clone(); }
-            json!({"version": ENVELOPE_VERSION, "ok": false, "command": command, "error": e})
-        }
+/// What to do next, for the errors where nothing reached the device (the same hints agent-desktop gives).
+fn recovery(code: &str) -> Option<RecoveryHint> {
+    let hint = |strategy: &str, retry_after_ms| RecoveryHint { strategy: strategy.into(), retryable: true, requires_fresh_snapshot: true, retry_after_ms };
+    match code {
+        "STALE_REF" | "SNAPSHOT_NOT_FOUND" => Some(hint("refresh_snapshot_then_retry_original", None)),
+        "TIMEOUT" | "APP_UNRESPONSIVE" => Some(hint("inspect_state_then_retry_original", Some(250))),
+        _ => None,
     }
+}
+
+fn envelope(command: &str, r: &Res) -> Value {
+    let response = match r {
+        Ok(data) => Response::ok(command, data.clone()),
+        Err(f) => {
+            let mut p = ErrorPayload::new(f.code, f.message.clone());
+            p.suggestion = f.suggestion.clone();
+            p.details = f.details.clone();
+            p.disposition = match f.sent {
+                Sent::No => DeliverySemantics::not_delivered(),
+                Sent::Maybe => DeliverySemantics::uncertain(),
+                Sent::Yes => DeliverySemantics::delivered_unverified(),
+            };
+            if f.sent == Sent::No {
+                p.recovery = recovery(f.code);
+            }
+            Response::err(command, p)
+        }
+    };
+    serde_json::to_value(response).expect("the envelope is plain data")
 }
 
 /// Snapshots live on disk between calls, as agent-desktop's do: a ref is `@<snapshot_id>:e<N>`.
@@ -234,6 +264,11 @@ impl App<'_> {
 
     fn shell(&self, cmd: &str) -> Result<adb::Output, Fail> {
         self.adb(&["shell", cmd])
+    }
+
+    /// A device command that sends input. If adb does not come back, the input may or may not have landed.
+    fn send(&self, cmd: &str) -> Result<adb::Output, Fail> {
+        self.shell(cmd).map_err(Fail::maybe_sent)
     }
 
     /// The serial every command acts on. More than one online device and no choice made is an error, never a guess.
@@ -311,7 +346,10 @@ impl App<'_> {
         let root = self.dump()?;
         let mut all = Vec::new();
         root.walk(&mut all);
-        let hits: Vec<&UiNode> = all.into_iter().filter(|n| n.visible() && matches(n, role, name, text, rid)).collect();
+        let all_hits: Vec<&UiNode> = all.into_iter().filter(|n| n.visible() && matches(n, role, name, text, rid)).collect();
+        // A nameless row matches through the text inside it. When that text matched too, they are one hit: keep the text.
+        let borrowed = |n: &UiNode| n.name().is_none() && all_hits.iter().any(|h| h.path.len() > n.path.len() && h.path.starts_with(&n.path));
+        let hits: Vec<&UiNode> = all_hits.iter().copied().filter(|n| !borrowed(n)).collect();
         if count {
             return Ok(json!({"count": hits.len()}));
         }
@@ -333,7 +371,7 @@ impl App<'_> {
             return Err(Fail::new(E::ActionFailed, format!("the element of {r} is disabled")));
         }
         let (x, y) = n.center();
-        let out = self.shell(&format!("input tap {x} {y}"))?;
+        let out = self.send(&format!("input tap {x} {y}"))?;
         if !out.ok() {
             return Err(Fail::new(E::ActionFailed, format!("input tap failed: {}", out.stderr.trim())).after_input());
         }
@@ -355,8 +393,9 @@ impl App<'_> {
         if !text.is_empty() {
             steps.push(format!("input text '{typed}'"));
         }
-        for step in &steps {
-            let out = self.shell(step)?;
+        for (i, step) in steps.iter().enumerate() {
+            // The first step may not have landed; once it has, a later failure leaves the field half changed.
+            let out = self.shell(step).map_err(|f| if i == 0 { f.maybe_sent() } else { f.after_input() })?;
             if !out.ok() {
                 return Err(Fail::new(E::ActionFailed, format!("`{}` failed: {}", step.split(' ').take(2).collect::<Vec<_>>().join(" "), out.stderr.trim())).after_input());
             }
@@ -365,6 +404,10 @@ impl App<'_> {
         let after = self.element(r).map_err(Fail::after_input)?;
         if after.password {
             return Ok(json!({"ref_id": r, "action": "set-value", "verified": false, "reason": "password fields do not expose their content"}));
+        }
+        if !text.is_empty() && text == after.hint && after.content().is_empty() {
+            // uiautomator reports an empty field's placeholder as its text, so this text cannot be told from it.
+            return Ok(json!({"ref_id": r, "action": "set-value", "verified": false, "reason": "the text equals the field's placeholder, which an empty field also shows"}));
         }
         if after.content() != text {
             return Err(Fail::new(E::ActionFailed, "the field does not hold the text that was typed").details(json!({"expected": text, "found": after.content()})).after_input());
@@ -381,15 +424,27 @@ impl App<'_> {
         let mut polls = 0u32;
         loop {
             polls += 1;
-            let root = self.dump()?;
-            let mut all = Vec::new();
-            root.walk(&mut all);
-            let present = all.iter().any(|n| n.visible() && matches(n, None, None, text, rid));
-            if present != gone {
-                return Ok(json!({"waited_ms": started.elapsed().as_millis() as u64, "polls": polls, "condition": if gone { "gone" } else { "present" }}));
-            }
+            // A screen in transition gives no tree ("could not get idle state"): that is a reason to keep waiting,
+            // not an answer. Only a tree can say the condition holds.
+            let seen = match self.dump() {
+                Ok(root) => {
+                    let mut all = Vec::new();
+                    root.walk(&mut all);
+                    let present = all.iter().any(|n| n.visible() && matches(n, None, None, text, rid));
+                    if present != gone {
+                        return Ok(json!({"waited_ms": started.elapsed().as_millis() as u64, "polls": polls, "condition": if gone { "gone" } else { "present" }}));
+                    }
+                    json!({"foreground": root.package})
+                }
+                Err(f) if f.code == "APP_UNRESPONSIVE" => json!({"last_error": f.message}),
+                Err(f) => return Err(f),
+            };
             if started.elapsed() >= Duration::from_millis(timeout_ms) {
-                return Err(Fail::new(E::Timeout, format!("still {} after {timeout_ms} ms", if gone { "present" } else { "absent" })).details(json!({"text": text, "id": rid, "foreground": root.package, "polls": polls})));
+                let mut d = json!({"text": text, "id": rid, "polls": polls});
+                for (k, v) in seen.as_object().into_iter().flatten() {
+                    d[k] = v.clone();
+                }
+                return Err(Fail::new(E::Timeout, format!("still {} after {timeout_ms} ms", if gone { "present" } else { "absent" })).details(d));
             }
             std::thread::sleep(self.tick);
         }
@@ -401,7 +456,9 @@ impl App<'_> {
             app.to_string()
         } else {
             let out = self.shell(&format!("cmd package resolve-activity --brief {}", quote(app)))?;
-            match out.text().lines().map(str::trim).filter(|l| l.contains('/')).next_back() {
+            // a component is `package/activity`: nothing else on a line, so "/system/bin/sh: cmd: not found" is not one
+            let component = |l: &&str| l.split_once('/').is_some_and(|(p, a)| !p.is_empty() && !a.is_empty() && l.chars().all(|c| c.is_ascii_alphanumeric() || "._$/".contains(c)));
+            match out.text().lines().map(str::trim).filter(component).next_back() {
                 Some(c) => c.to_string(),
                 None => return Err(Fail::new(E::AppNotFound, format!("{app} has no launchable activity or is not installed")).hint("mola-cua install <apk>")),
             }
@@ -414,7 +471,9 @@ impl App<'_> {
             return Err(Fail::new(E::ActionFailed, format!("{component} did not start: {why}")).after_input());
         }
         let ms = t.lines().find_map(|l| l.trim().strip_prefix("TotalTime:")).and_then(|v| v.trim().parse::<u64>().ok());
-        Ok(json!({"package": component.split('/').next(), "component": component, "status": "ok", "launch_ms": ms}))
+        // "its current task has been brought to the front": the app was already running and kept its state
+        let warm = t.contains("brought to the front");
+        Ok(json!({"package": component.split('/').next(), "component": component, "status": "ok", "launch_ms": ms, "already_running": warm}))
     }
 
     fn health(&self, package: &str, clear: bool) -> Res {
@@ -425,7 +484,7 @@ impl App<'_> {
         }
         let pid = self.shell(&format!("pidof {}", quote(package)))?.text().trim().to_string();
         let log = self.adb(&["logcat", "-d", "-b", "crash"])?.text();
-        let lines: Vec<&str> = log.lines().filter(|l| l.contains(package)).collect();
+        let lines: Vec<&str> = log.lines().filter(|l| names_package(l, package)).collect();
         Ok(json!({"package": package, "running": !pid.is_empty(), "pid": pid.split_whitespace().next(), "crashed": !lines.is_empty(), "crash_lines": lines.iter().take(20).collect::<Vec<_>>()}))
     }
 
@@ -448,7 +507,8 @@ impl App<'_> {
                 self.serial()?;
                 let out = self.adb(&["install", "-r", &apk.to_string_lossy()])?;
                 let t = format!("{}{}", out.text(), out.stderr);
-                if !t.contains("Success") {
+                // the word on a line of its own, and a clean exit: a path such as SuccessStory.apk in an error is not success
+                if !(out.ok() && out.text().lines().any(|l| l.trim() == "Success")) {
                     return Err(Fail::new(E::ActionFailed, format!("install failed: {}", t.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim())).after_input());
                 }
                 Ok(json!({"apk": apk, "installed": true}))
@@ -465,7 +525,7 @@ impl App<'_> {
             Cmd::Get { r#ref, property } => {
                 let n = self.element(r#ref)?;
                 let v = match property.as_str() {
-                    "text" => json!(n.value().or_else(|| n.name())),
+                    "text" => json!(n.value().or_else(|| n.label())),
                     "value" => json!(n.value()),
                     "role" => json!(n.role()),
                     "states" => json!(n.states()),
@@ -507,7 +567,7 @@ impl App<'_> {
                     other => other.parse::<u32>().map_err(|_| Fail::new(E::InvalidArgs, format!("unknown key `{key}`")).hint("back, home, enter, tab, delete, menu, app-switch, or a keycode number"))?,
                 };
                 self.serial()?;
-                let out = self.shell(&format!("input keyevent {code}"))?;
+                let out = self.send(&format!("input keyevent {code}"))?;
                 if !out.ok() {
                     return Err(Fail::new(E::ActionFailed, out.stderr.trim().to_string()).after_input());
                 }
@@ -526,6 +586,12 @@ impl App<'_> {
             Cmd::Desktop(_) => unreachable!("handled before an adb is needed"),
         }
     }
+}
+
+/// Does a log line name exactly this package (not `com.example.app2` when asked about `com.example.app`)?
+fn names_package(line: &str, package: &str) -> bool {
+    let part = |c: char| c.is_ascii_alphanumeric() || c == '.' || c == '_';
+    line.match_indices(package).any(|(i, m)| !line[..i].chars().next_back().is_some_and(part) && !line[i + m.len()..].chars().next().is_some_and(part))
 }
 
 /// Single-quote for the device shell.
@@ -613,15 +679,35 @@ fn home() -> PathBuf {
     })
 }
 
+/// The agent-desktop executable. Never a shell: `cmd /c` would reinterpret `&`, `|` and `%VAR%` in the arguments.
+/// npm installs a `.cmd` launcher on Windows; the native binary it starts sits in the package beside it.
+fn agent_desktop(env: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    if let Some(p) = env("MOLA_CUA_AGENT_DESKTOP").map(PathBuf::from) {
+        let script = p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("cmd") || e.eq_ignore_ascii_case("bat"));
+        return if p.is_file() && !script { Ok(p) } else { Err(format!("MOLA_CUA_AGENT_DESKTOP must point at the agent-desktop executable (not a .cmd launcher): {}", p.display())) };
+    }
+    let dirs: Vec<PathBuf> = env("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    if !cfg!(windows) {
+        return dirs.iter().map(|d| d.join("agent-desktop")).find(|p| p.is_file()).ok_or_else(|| "agent-desktop is not on PATH".to_string());
+    }
+    let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+    for d in &dirs {
+        let exe = d.join("agent-desktop.exe");
+        if exe.is_file() {
+            return Ok(exe);
+        }
+        let native = d.join("node_modules").join("agent-desktop").join("bin").join(format!("agent-desktop-win32-{arch}.exe"));
+        if d.join("agent-desktop.cmd").is_file() && native.is_file() {
+            return Ok(native);
+        }
+    }
+    Err("agent-desktop is not on PATH".to_string())
+}
+
 /// Hand a command to agent-desktop with our stdio; its exit code becomes ours.
 fn desktop(args: &[String]) -> std::process::ExitCode {
-    let bin = std::env::var("MOLA_CUA_AGENT_DESKTOP").unwrap_or_else(|_| "agent-desktop".into());
-    // On Windows npm installs a .cmd launcher, which only a shell can start.
-    let status = if cfg!(windows) {
-        std::process::Command::new("cmd").arg("/c").arg(&bin).args(args).status()
-    } else {
-        std::process::Command::new(&bin).args(args).status()
-    };
+    let env = |k: &str| std::env::var(k).ok();
+    let status = agent_desktop(&env).and_then(|bin| std::process::Command::new(&bin).args(args).status().map_err(|e| format!("{}: {e}", bin.display())));
     match status {
         Ok(s) => std::process::ExitCode::from(s.code().unwrap_or(1).clamp(0, 255) as u8),
         Err(e) => {
@@ -641,8 +727,10 @@ fn main() -> std::process::ExitCode {
     let name = command_name(&cli.cmd);
     let env = |k: &str| std::env::var(k).ok();
     let Some(bin) = locate_adb(&env) else {
-        let r: Res = Err(Fail::new(E::PlatformNotSupported, "adb was not found on PATH or in the Android SDK locations")
-            .hint("Install Android SDK Platform-Tools, or set MOLA_CUA_ADB to the adb executable."));
+        let r: Res = Err(match env("MOLA_CUA_ADB") {
+            Some(p) => Fail::new(E::PlatformNotSupported, format!("MOLA_CUA_ADB is set to {p}, which is not a file")).hint("Point MOLA_CUA_ADB at the adb executable, or unset it to search PATH and the Android SDK."),
+            None => Fail::new(E::PlatformNotSupported, "adb was not found on PATH or in the Android SDK locations").hint("Install Android SDK Platform-Tools, or set MOLA_CUA_ADB to the adb executable."),
+        });
         println!("{}", envelope(name, &r));
         return std::process::ExitCode::from(1);
     };

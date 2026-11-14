@@ -13,6 +13,10 @@ struct FakeAdb {
     /// when a shell command with this prefix runs, the screen becomes this
     on: RefCell<Vec<(&'static str, String)>>,
     serial: Option<String>,
+    /// a call whose joined arguments start with this never comes back (adb's own timeout error)
+    hangs_on: Option<&'static str>,
+    /// exit status and output for calls starting with a prefix (default: 0 and the scripted reply)
+    exits: Vec<(&'static str, i32, &'static str)>,
 }
 
 impl FakeAdb {
@@ -24,6 +28,8 @@ impl FakeAdb {
             shell: vec![],
             on: RefCell::new(vec![]),
             serial: None,
+            hangs_on: None,
+            exits: vec![],
         }
     }
     fn calls(&self) -> Vec<String> {
@@ -39,6 +45,12 @@ impl Adb for FakeAdb {
         let line = args.join(" ");
         self.calls.borrow_mut().push(line.clone());
         let out = |s: &str| Ok(adb::Output { status: 0, stdout: s.as_bytes().to_vec(), stderr: String::new() });
+        if self.hangs_on.is_some_and(|p| line.starts_with(p)) {
+            return Err(format!("adb {} did not finish in 30000 ms", adb::brief(args)));
+        }
+        if let Some((_, status, text)) = self.exits.iter().find(|(p, _, _)| line.starts_with(p)) {
+            return Ok(adb::Output { status: *status, stdout: text.as_bytes().to_vec(), stderr: String::new() });
+        }
         if line == "devices" {
             return out(&self.devices);
         }
@@ -60,7 +72,17 @@ impl Adb for FakeAdb {
 }
 
 fn app<'a>(adb: &'a FakeAdb, tag: &str) -> App<'a> {
-    let dir = std::env::temp_dir().join(format!("mola-cua-test-{}-{tag}", std::process::id()));
+    // One directory per test run; the directories earlier runs left behind are removed here.
+    let base = std::env::temp_dir().join("mola-cua-tests");
+    if let Ok(rd) = std::fs::read_dir(&base) {
+        for e in rd.flatten() {
+            let old = e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|a| a.as_secs() > 600);
+            if old {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
+    let dir = base.join(format!("{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     App { adb, store: Store::new(dir), tick: Duration::ZERO }
 }
@@ -315,7 +337,7 @@ fn health_reports_running_and_crash_lines_for_the_package_only() {
     let mut fake = FakeAdb::new();
     fake.shell = vec![("pidof", "4242\n")];
     let adb = Crashy(fake);
-    let dir = std::env::temp_dir().join(format!("mola-cua-test-{}-health", std::process::id()));
+    let dir = std::env::temp_dir().join("mola-cua-tests").join(format!("{}-health", std::process::id()));
     let a = App { adb: &adb, store: Store::new(dir), tick: Duration::ZERO };
     let r = a.health("com.example.app", false).unwrap();
     assert_eq!((r["running"].as_bool(), r["crashed"].as_bool(), r["crash_lines"].as_array().unwrap().len()), (Some(true), Some(true), 1));
@@ -329,4 +351,161 @@ fn press_maps_names_to_keycodes() {
     a.run(&Cmd::Press { key: "66".into() }).unwrap();
     assert_eq!(adb.shell_calls(), vec!["input keyevent 4", "input keyevent 66"]);
     assert_eq!(code(&a.run(&Cmd::Press { key: "banana".into() })), "INVALID_ARGS");
+}
+
+// ---------------------------------------------------------------- review round 1
+
+fn disposition(r: &Res) -> (String, String) {
+    let e = envelope("x", r);
+    (e["error"]["disposition"]["delivery"].as_str().unwrap().to_string(), e["error"]["disposition"]["retry"].as_str().unwrap().to_string())
+}
+
+#[test]
+fn an_error_envelope_is_core_s_own_shape_in_core_s_key_order() {
+    let adb = FakeAdb::new();
+    let a = app(&adb, "shape");
+    let stale = {
+        let login = ref_of(&a.snapshot(None, true, false).unwrap(), "Log in");
+        *adb.screen.borrow_mut() = ui::SAMPLE.replace("text=\"Log in\"", "text=\"Loading\"");
+        envelope("click", &a.click(&login))
+    };
+    let keys: Vec<&String> = stale["error"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["code", "message", "suggestion", "recovery", "disposition"]);
+    assert_eq!(stale["error"]["recovery"]["strategy"], "refresh_snapshot_then_retry_original");
+    // every delivery value is one core defines
+    let p: agent_desktop_core::DeliveryDisposition = serde_json::from_value(stale["error"]["disposition"]["delivery"].clone()).unwrap();
+    assert_eq!(p, agent_desktop_core::DeliveryDisposition::NotDelivered);
+}
+
+#[test]
+fn a_tap_that_does_not_come_back_is_not_reported_as_not_delivered() {
+    let mut adb = FakeAdb::new();
+    let login = ref_of(&app(&adb, "hang0").snapshot(None, true, false).unwrap(), "Log in");
+    let dir = std::env::temp_dir().join("mola-cua-tests").join(format!("{}-hang0", std::process::id()));
+    adb.hangs_on = Some("shell input tap");
+    let a = App { adb: &adb, store: Store::new(dir.clone()), tick: Duration::ZERO };
+    let r = a.click(&login);
+    assert_eq!(code(&r), "TIMEOUT");
+    assert_eq!(disposition(&r), ("delivery_uncertain".to_string(), "unsafe".to_string()));
+    assert!(envelope("click", &r)["error"].get("recovery").is_none(), "no retry hint when input may have landed");
+
+    // set-value: the tap landed, typing did not come back → input was delivered
+    adb.hangs_on = Some("shell input text");
+    let b = App { adb: &adb, store: Store::new(dir), tick: Duration::ZERO };
+    let user = b.find(None, None, None, Some("user"), true, false).unwrap()["match"]["ref_id"].as_str().unwrap().to_string();
+    let r = b.set_value(&user, "s3cret");
+    assert_eq!(disposition(&r).0, "delivered_unverified");
+    assert!(!envelope("set-value", &r).to_string().contains("s3cret"), "the typed text reached the error output");
+}
+
+#[test]
+fn a_key_press_that_does_not_come_back_is_uncertain() {
+    let mut adb = FakeAdb::new();
+    adb.hangs_on = Some("shell input keyevent");
+    let r = app(&adb, "hangkey").run(&Cmd::Press { key: "back".into() });
+    assert_eq!(disposition(&r).0, "delivery_uncertain");
+}
+
+#[test]
+fn a_row_named_by_its_text_is_stale_once_another_row_is_there_and_nothing_is_tapped() {
+    let row = |t: &str, y: i32| format!("<node class=\"android.widget.LinearLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" clickable=\"true\" enabled=\"true\" bounds=\"[0,{y}][100,{}]\"><node class=\"android.widget.TextView\" package=\"p\" text=\"{t}\" resource-id=\"android:id/title\" content-desc=\"\" enabled=\"true\" bounds=\"[0,{y}][100,{}]\" /></node>", y + 100, y + 50);
+    let screen = |a: &str, b: &str| format!("<hierarchy rotation=\"0\"><node class=\"android.widget.ListView\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,200]\">{}{}</node></hierarchy>", row(a, 0), row(b, 100));
+    let adb = FakeAdb::new();
+    *adb.screen.borrow_mut() = screen("Alpha", "Beta");
+    let a = app(&adb, "rows");
+    let alpha = ref_of(&a.snapshot(None, true, false).unwrap(), "Alpha");
+    *adb.screen.borrow_mut() = screen("Gamma", "Delta");
+    assert_eq!(code(&a.click(&alpha)), "STALE_REF");
+    assert!(adb.shell_calls().is_empty());
+}
+
+#[test]
+fn find_counts_a_row_and_the_text_that_names_it_once_and_get_reads_the_row_s_label() {
+    let adb = FakeAdb::new();
+    *adb.screen.borrow_mut() = "<hierarchy rotation=\"0\"><node class=\"android.widget.LinearLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" clickable=\"true\" enabled=\"true\" bounds=\"[0,0][100,100]\"><node class=\"android.widget.TextView\" package=\"p\" text=\"Network\" resource-id=\"android:id/title\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,50]\" /></node></hierarchy>".into();
+    let a = app(&adb, "dedupe");
+    assert_eq!(a.find(None, None, Some("Network"), None, false, true).unwrap()["count"], 1);
+    assert_eq!(a.find(None, None, Some("Network"), None, true, false).unwrap()["match"]["role"], "text");
+    let row = ref_of(&a.snapshot(None, true, false).unwrap(), "Network");
+    assert_eq!(a.run(&Cmd::Get { r#ref: row, property: "text".into() }).unwrap()["value"], "Network");
+}
+
+#[test]
+fn health_counts_crashes_of_this_package_only() {
+    assert!(names_package("E AndroidRuntime: Process: com.example.app, PID: 77", "com.example.app"));
+    assert!(!names_package("E AndroidRuntime: Process: com.example.app2, PID: 9", "com.example.app"));
+    assert!(!names_package("E AndroidRuntime: Process: xcom.example.app, PID: 9", "com.example.app"));
+    assert!(!names_package("Process: com.example.app.debug", "com.example.app"));
+    assert!(names_package("com.example.app", "com.example.app"));
+}
+
+#[test]
+fn install_needs_a_clean_exit_and_the_word_success_on_its_own_line() {
+    let apk = std::env::temp_dir().join("mola-cua-tests").join(format!("{}-SuccessStory.apk", std::process::id()));
+    std::fs::create_dir_all(apk.parent().unwrap()).unwrap();
+    std::fs::write(&apk, b"x").unwrap();
+    let mut adb = FakeAdb::new();
+    adb.exits = vec![("install", 1, "Performing Streamed Install\nadb: failed to install SuccessStory.apk: Failure [INSTALL_FAILED_INVALID_APK]\n")];
+    let r = app(&adb, "inst").run(&Cmd::Install { apk: apk.clone() });
+    assert_eq!(code(&r), "ACTION_FAILED");
+    assert!(r.as_ref().err().unwrap().message.contains("INSTALL_FAILED_INVALID_APK"));
+    adb.exits = vec![("install", 0, "Performing Streamed Install\nSuccess\n")];
+    assert_eq!(app(&adb, "inst2").run(&Cmd::Install { apk }).unwrap()["installed"], true);
+}
+
+#[test]
+fn text_equal_to_the_placeholder_is_reported_as_unverified_not_as_a_failure() {
+    let hinted = ui::SAMPLE.replace("text=\"ada\" resource-id=\"com.example.app:id/user\"", "text=\"Search\" hint=\"Search\" resource-id=\"com.example.app:id/user\"");
+    let adb = FakeAdb::new();
+    *adb.screen.borrow_mut() = hinted;
+    let a = app(&adb, "hint");
+    let user = a.find(None, None, None, Some("user"), true, false).unwrap()["match"]["ref_id"].as_str().unwrap().to_string();
+    let r = a.set_value(&user, "Search").unwrap();
+    assert_eq!(r["verified"], false);
+    assert_eq!(code(&a.set_value(&user, "other")), "ACTION_FAILED");
+}
+
+#[test]
+fn wait_keeps_polling_while_the_device_gives_no_tree_and_says_so_when_time_runs_out() {
+    let adb = FakeAdb::new();
+    *adb.screen.borrow_mut() = "ERROR: could not get idle state.\n".into();
+    let r = app(&adb, "waitidle").wait(Some("Sign in"), None, false, 0);
+    assert_eq!(code(&r), "TIMEOUT");
+    assert!(r.as_ref().err().unwrap().details.as_ref().unwrap()["last_error"].as_str().unwrap().contains("idle state"));
+}
+
+#[test]
+fn launch_does_not_take_a_shell_error_for_a_component_and_says_when_the_app_was_already_running() {
+    let mut adb = FakeAdb::new();
+    adb.shell = vec![("cmd package resolve-activity", "/system/bin/sh: cmd: not found\n")];
+    assert_eq!(code(&app(&adb, "l1").launch("com.example.app")), "APP_NOT_FOUND");
+    adb.shell = vec![("am start", "Starting: Intent\nWarning: Activity not started, its current task has been brought to the front\nStatus: ok\n")];
+    assert_eq!(app(&adb, "l2").launch("com.example.app/.Main").unwrap()["already_running"], true);
+}
+
+#[test]
+fn agent_desktop_is_resolved_to_an_executable_never_to_a_launcher_script() {
+    let dir = std::env::temp_dir().join("mola-cua-tests").join(format!("{}-ad", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("agent-desktop.cmd");
+    std::fs::write(&script, b"@echo off").unwrap();
+    let s = script.to_string_lossy().to_string();
+    let e = agent_desktop(&|k| (k == "MOLA_CUA_AGENT_DESKTOP").then(|| s.clone())).unwrap_err();
+    assert!(e.contains("not a .cmd launcher"), "{e}");
+    let path = dir.to_string_lossy().to_string();
+    let on_path = |k: &str| (k == "PATH").then(|| path.clone());
+    if cfg!(windows) {
+        // a launcher with no native binary beside it is not started through a shell
+        assert!(agent_desktop(&on_path).is_err());
+        let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "x64" };
+        let native = dir.join("node_modules").join("agent-desktop").join("bin").join(format!("agent-desktop-win32-{arch}.exe"));
+        std::fs::create_dir_all(native.parent().unwrap()).unwrap();
+        std::fs::write(&native, b"").unwrap();
+        assert_eq!(agent_desktop(&on_path).unwrap(), native);
+    } else {
+        assert!(agent_desktop(&on_path).is_err());
+        std::fs::write(dir.join("agent-desktop"), b"").unwrap();
+        assert_eq!(agent_desktop(&on_path).unwrap(), dir.join("agent-desktop"));
+    }
 }

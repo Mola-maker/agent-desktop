@@ -21,10 +21,11 @@ mola-cua snapshot --app Finder -i         # not an Android command: goes to agen
 
 ## How it differs from a script of adb calls
 
-- **A ref is never a coordinate.** It stores what the element is (class, resource id, description, text, position in the tree). Every action takes a fresh UI dump, finds that element again, and taps where it is now. Gone → `STALE_REF`. Several equal candidates and none in the same place → `AMBIGUOUS_TARGET`.
-- **Errors say whether input was sent.** `error.disposition` is `not_delivered` / `safe` when nothing reached the device, `delivered` / `unsafe` when it may have. Retry only the first kind.
+- **A ref is never a coordinate.** It stores what the element is (class, resource id, description, text, placeholder, the label a nameless row takes from the texts inside it, position in the tree). A list row is its label, not its slot: after a scroll the ref for "Alpha" does not tap whatever sits where Alpha was. Every action takes a fresh UI dump, finds that element again, and taps where it is now. Gone → `STALE_REF`. Several equal candidates and none in the same place → `AMBIGUOUS_TARGET`.
+- **Errors say whether input was sent**, in agent-desktop-core's own terms: `not_delivered` (retry is safe), `delivery_uncertain` (the call that sends input did not come back), `delivered_unverified` (input went out and a later step failed). Retry only the first kind. The envelope is serialised through core's `Response` and `ErrorPayload`, so it parses with the same code.
 - **`set-value` checks its own work.** It reads the field back and fails with `expected` and `found` when they differ. A password field is typed but reported `verified: false`.
-- **Password content never leaves the device tree.** It is masked in every output and is not searchable with `find --text`.
+- **Password content never leaves the device tree.** It is masked in snapshots, `find`, `get` and labels, is not searchable with `find --text`, and error messages name the adb command without its arguments, so typed text is not echoed back. The text does reach `adb` as an argument (`--stdin` only keeps it out of this command's own arguments).
+- **Desktop commands are started without a shell.** On Windows the native agent-desktop binary inside the npm package is run directly, so `&`, `|` and `%VAR%` in an argument stay text.
 - **More than one device is an error until you choose** (`--device <serial>` or `ANDROID_SERIAL`).
 - **adb is found where Android Studio puts it** when it is not on PATH (`MOLA_CUA_ADB`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, the default SDK directories).
 

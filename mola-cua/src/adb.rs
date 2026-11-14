@@ -91,7 +91,8 @@ impl Adb for RealAdb {
                 None if Instant::now() >= deadline => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(format!("adb {} did not finish in {} ms", args.join(" "), self.timeout.as_millis()));
+                    // Name the command, never its arguments: `shell input text '…'` carries what was typed.
+                    return Err(format!("adb {} did not finish in {} ms", brief(args), self.timeout.as_millis()));
                 }
                 None => std::thread::sleep(Duration::from_millis(10)),
             }
@@ -106,6 +107,16 @@ impl Adb for RealAdb {
     fn describe(&self) -> (String, Option<String>) {
         (self.bin.display().to_string(), self.serial.clone())
     }
+}
+
+/// `shell input text 'secret'` → `shell input text`: the subcommand and the device command's first two words.
+pub fn brief(args: &[&str]) -> String {
+    let mut words: Vec<&str> = args.first().copied().into_iter().collect();
+    if let Some(rest) = args.get(1) {
+        let keep = if args[0] == "shell" { 2 } else { 1 };
+        words.extend(rest.split_whitespace().take(keep).filter(|w| !w.contains('\'')));
+    }
+    words.join(" ")
 }
 
 /// Rows of `adb devices`: `<serial><TAB><state>`. Notices ("* daemon started", "adb server version … doesn't match")
@@ -133,6 +144,14 @@ mod tests {
                 ("0123".into(), "no permissions (udev)".into())
             ]
         );
+    }
+
+    #[test]
+    fn an_error_names_the_command_and_never_what_was_typed() {
+        assert_eq!(brief(&["shell", "input text 's3cret pass'"]), "shell input text");
+        assert_eq!(brief(&["shell", "input tap 10 20"]), "shell input tap");
+        assert_eq!(brief(&["install", "-r", "C:/x/app.apk"]), "install -r");
+        assert_eq!(brief(&["devices"]), "devices");
     }
 
     #[test]

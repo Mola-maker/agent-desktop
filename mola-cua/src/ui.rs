@@ -41,6 +41,9 @@ pub struct Identity {
     /// the label a nameless container borrows from the texts inside it: what tells one list row from another
     #[serde(default)]
     pub label: String,
+    /// every text the label was built from: what tells apart two rows that share a first line (two "John"s)
+    #[serde(default)]
+    pub label_full: String,
     pub path: Vec<u32>,
 }
 
@@ -196,6 +199,7 @@ impl UiNode {
             hint: self.hint.clone(),
             // The first text only: a row's second line (a status, a count, a time) changes while the row stays the row.
             label: if self.name().is_none() { self.label().map(|l| l.split(" · ").next().unwrap_or("").to_string()).unwrap_or_default() } else { String::new() },
+            label_full: if self.name().is_none() { self.label().unwrap_or_default() } else { String::new() },
             path: self.path.clone(),
         }
     }
@@ -264,11 +268,17 @@ pub fn resolve<'a>(root: &'a UiNode, id: &Identity) -> Result<Option<&'a UiNode>
         // An element with nothing but a class is only itself in the same place: elsewhere it is some other element.
         1 if !id.anchored() && hits[0].path != id.path => Ok(None),
         1 => Ok(Some(hits[0])),
-        n => match hits.iter().find(|h| h.path == id.path) {
-            // Several twins (list rows): the one in the same place is the one the ref meant.
-            Some(h) => Ok(Some(h)),
-            None => Err(n),
-        },
+        n => {
+            // Several candidates share the first line. The second line may change on a row that is alone with its
+            // title, but among twins it is what says which one the ref meant: only a twin with every text equal counts.
+            let exact: Vec<&&UiNode> = hits.iter().filter(|h| h.identity().label_full == id.label_full).collect();
+            match exact.len() {
+                1 => Ok(Some(exact[0])),
+                0 => Err(n),
+                // identical in every text (plain list rows): the one in the same place
+                _ => exact.iter().find(|h| h.path == id.path).map(|h| Some(**h)).ok_or(n),
+            }
+        }
     }
 }
 
@@ -381,6 +391,34 @@ mod tests {
         assert_eq!(resolve(&scrolled, &alpha), Ok(None), "the ref for Alpha resolved to the row now in its place");
         let moved = parse_dump(&screen("Zed", "Alpha")).unwrap();
         assert_eq!(resolve(&moved, &alpha).unwrap().unwrap().bounds.1, 100, "Alpha moved down and is still Alpha");
+    }
+
+    #[test]
+    fn rows_that_share_a_title_are_told_apart_by_their_second_line() {
+        let row = |title: &str, sub: &str, y: i32| {
+            format!(
+                "<node class=\"android.widget.LinearLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" clickable=\"true\" enabled=\"true\" bounds=\"[0,{y}][100,{}]\"><node class=\"android.widget.TextView\" package=\"p\" text=\"{title}\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,{y}][100,{}]\" /><node class=\"android.widget.TextView\" package=\"p\" text=\"{sub}\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,{}][100,{}]\" /></node>",
+                y + 100,
+                y + 50,
+                y + 50,
+                y + 100
+            )
+        };
+        let screen = |rows: &[(&str, &str)]| {
+            let body: String = rows.iter().enumerate().map(|(i, (t, s))| row(t, s, i as i32 * 100)).collect();
+            format!("<hierarchy rotation=\"0\"><node class=\"android.widget.ListView\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,300]\">{body}</node></hierarchy>")
+        };
+        let before = parse_dump(&screen(&[("John", "mobile"), ("John", "work")])).unwrap();
+        let mobile = before.children[0].children[0].identity();
+        // scrolled: the first slot now holds the other John
+        let scrolled = parse_dump(&screen(&[("John", "work"), ("John", "home")])).unwrap();
+        assert_eq!(resolve(&scrolled, &mobile), Err(2), "tapped another John");
+        // moved down one slot: still found, by its texts
+        let moved = parse_dump(&screen(&[("Zed", "x"), ("John", "work"), ("John", "mobile")])).unwrap();
+        assert_eq!(resolve(&moved, &mobile).unwrap().unwrap().bounds.1, 200);
+        // alone with its title, a changed second line does not matter
+        let alone = parse_dump(&screen(&[("John", "busy"), ("Mary", "work")])).unwrap();
+        assert_eq!(resolve(&alone, &mobile).unwrap().unwrap().bounds.1, 0);
     }
 
     #[test]

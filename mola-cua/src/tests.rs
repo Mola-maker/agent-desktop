@@ -565,3 +565,23 @@ fn a_failed_typing_step_does_not_repeat_the_device_message() {
     assert_eq!(code(&r), "ACTION_FAILED");
     assert_eq!(r.as_ref().err().unwrap().message, "`input text` failed with exit 1");
 }
+
+// ---------------------------------------------------------------- review round 4
+
+#[test]
+fn a_ref_that_had_a_twin_does_not_tap_the_twin_when_it_is_the_only_one_left() {
+    let row = |t: &str, sub: &str, y: i32| format!("<node class=\"android.widget.LinearLayout\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" clickable=\"true\" enabled=\"true\" bounds=\"[0,{y}][100,{}]\"><node class=\"android.widget.TextView\" package=\"p\" text=\"{t}\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,{y}][100,{}]\" /><node class=\"android.widget.TextView\" package=\"p\" text=\"{sub}\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,{}][100,{}]\" /></node>", y + 100, y + 50, y + 50, y + 100);
+    let screen = |a: (&str, &str), b: (&str, &str)| format!("<hierarchy rotation=\"0\"><node class=\"android.widget.ListView\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,200]\">{}{}</node></hierarchy>", row(a.0, a.1, 0), row(b.0, b.1, 100));
+    let adb = FakeAdb::new();
+    *adb.screen.borrow_mut() = screen(("John", "mobile"), ("John", "work"));
+    let a = app(&adb, "twin");
+    let mobile = ref_of(&a.snapshot(None, true, false).unwrap(), "John · mobile");
+    *adb.screen.borrow_mut() = screen(("John", "work"), ("Zed", "x"));
+    assert_eq!(code(&a.click(&mobile)), "STALE_REF");
+    assert!(adb.shell_calls().is_empty());
+    // the same through find
+    *adb.screen.borrow_mut() = screen(("John", "mobile"), ("John", "work"));
+    let found = a.find(Some("group"), Some("John · mobile"), None, None, true, false).unwrap()["match"]["ref_id"].as_str().unwrap().to_string();
+    *adb.screen.borrow_mut() = screen(("John", "work"), ("Zed", "x"));
+    assert_eq!(code(&a.click(&found)), "STALE_REF");
+}

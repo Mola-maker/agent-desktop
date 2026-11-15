@@ -44,6 +44,9 @@ pub struct Identity {
     /// every text the label was built from: what tells apart two rows that share a first line (two "John"s)
     #[serde(default)]
     pub label_full: String,
+    /// when the ref was made, another element on the screen had the same class, id, description and first line
+    #[serde(default)]
+    pub shared_title: bool,
     pub path: Vec<u32>,
 }
 
@@ -200,6 +203,7 @@ impl UiNode {
             // The first text only: a row's second line (a status, a count, a time) changes while the row stays the row.
             label: if self.name().is_none() { self.label().map(|l| l.split(" · ").next().unwrap_or("").to_string()).unwrap_or_default() } else { String::new() },
             label_full: if self.name().is_none() { self.label().unwrap_or_default() } else { String::new() },
+            shared_title: false,
             path: self.path.clone(),
         }
     }
@@ -254,6 +258,21 @@ pub fn wants_ref(n: &UiNode) -> bool {
     n.visible() && (n.interactive() || n.name().is_some())
 }
 
+/// Note on each stored identity whether the screen it came from held another element with the same first line.
+/// Counted over every node on the screen, not only the ones that got a ref.
+pub fn mark_shared<'a>(root: &UiNode, entries: impl Iterator<Item = &'a mut Identity>) {
+    let key = |i: &Identity| (i.class.clone(), i.resource_id.clone(), i.content_desc.clone(), i.text.clone(), i.hint.clone(), i.label.clone());
+    let mut all = Vec::new();
+    root.walk(&mut all);
+    let mut count = std::collections::HashMap::new();
+    for n in all {
+        *count.entry(key(&n.identity())).or_insert(0u32) += 1;
+    }
+    for id in entries {
+        id.shared_title = count.get(&key(id)).copied().unwrap_or(0) > 1;
+    }
+}
+
 /// Find the element an identity describes in a fresh tree. `Ok(None)` = gone (stale); `Err(n)` = n equal candidates.
 pub fn resolve<'a>(root: &'a UiNode, id: &Identity) -> Result<Option<&'a UiNode>, usize> {
     let mut all = Vec::new();
@@ -267,6 +286,8 @@ pub fn resolve<'a>(root: &'a UiNode, id: &Identity) -> Result<Option<&'a UiNode>
         0 => Ok(None),
         // An element with nothing but a class is only itself in the same place: elsewhere it is some other element.
         1 if !id.anchored() && hits[0].path != id.path => Ok(None),
+        // The ref had a twin when it was made. One candidate left may be that twin: it must match in every text.
+        1 if id.shared_title && hits[0].identity().label_full != id.label_full => Ok(None),
         1 => Ok(Some(hits[0])),
         n => {
             // Several candidates share the first line. The second line may change on a row that is alone with its
@@ -409,16 +430,28 @@ mod tests {
             format!("<hierarchy rotation=\"0\"><node class=\"android.widget.ListView\" package=\"p\" text=\"\" resource-id=\"\" content-desc=\"\" enabled=\"true\" bounds=\"[0,0][100,300]\">{body}</node></hierarchy>")
         };
         let before = parse_dump(&screen(&[("John", "mobile"), ("John", "work")])).unwrap();
-        let mobile = before.children[0].children[0].identity();
+        let mut mobile = before.children[0].children[0].identity();
+        mark_shared(&before, std::iter::once(&mut mobile));
+        assert!(mobile.shared_title);
+        // the list refreshed: only the other John is left, alone. It is not the John the ref meant.
+        let other_alone = parse_dump(&screen(&[("John", "work"), ("Zed", "x")])).unwrap();
+        assert_eq!(resolve(&other_alone, &mobile), Ok(None), "tapped the twin that was left");
+        // the same John left alone is still found
+        let same_alone = parse_dump(&screen(&[("Zed", "x"), ("John", "mobile")])).unwrap();
+        assert_eq!(resolve(&same_alone, &mobile).unwrap().unwrap().bounds.1, 100);
         // scrolled: the first slot now holds the other John
         let scrolled = parse_dump(&screen(&[("John", "work"), ("John", "home")])).unwrap();
         assert_eq!(resolve(&scrolled, &mobile), Err(2), "tapped another John");
         // moved down one slot: still found, by its texts
         let moved = parse_dump(&screen(&[("Zed", "x"), ("John", "work"), ("John", "mobile")])).unwrap();
         assert_eq!(resolve(&moved, &mobile).unwrap().unwrap().bounds.1, 200);
-        // alone with its title, a changed second line does not matter
+        // a ref made when its title was unique: a changed second line does not matter
+        let solo_screen = parse_dump(&screen(&[("John", "mobile"), ("Mary", "work")])).unwrap();
+        let mut solo = solo_screen.children[0].children[0].identity();
+        mark_shared(&solo_screen, std::iter::once(&mut solo));
+        assert!(!solo.shared_title);
         let alone = parse_dump(&screen(&[("John", "busy"), ("Mary", "work")])).unwrap();
-        assert_eq!(resolve(&alone, &mobile).unwrap().unwrap().bounds.1, 0);
+        assert_eq!(resolve(&alone, &solo).unwrap().unwrap().bounds.1, 0);
     }
 
     #[test]

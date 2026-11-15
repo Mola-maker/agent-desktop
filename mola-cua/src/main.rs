@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-use ui::{Identity, UiNode, parse_dump, resolve, wants_ref};
+use ui::{Identity, UiNode, mark_shared, parse_dump, resolve, wants_ref};
 
 #[derive(Parser)]
 #[command(name = "mola-cua", version, about = "Computer use for AI agents on Android (adb); desktop commands pass through to agent-desktop")]
@@ -333,6 +333,7 @@ impl App<'_> {
         let mut entries = BTreeMap::new();
         let mut counter = 0u32;
         let tree = render(&root, interactive, compact, &mut counter, &mut entries).unwrap_or_else(|| Value::Object(root.to_json(None)));
+        mark_shared(&root, entries.values_mut());
         let id = self.store.save(&serial, &entries)?;
         let tree = with_snapshot_id(tree, &id);
         Ok(json!({"app": root.package, "device": serial, "snapshot_id": id, "ref_count": entries.len(), "complete": true, "tree": tree}))
@@ -359,6 +360,7 @@ impl App<'_> {
         for (i, n) in hits.iter().enumerate() {
             entries.insert(format!("e{}", i + 1), n.identity());
         }
+        mark_shared(&root, entries.values_mut());
         let id = self.store.save(&serial, &entries)?;
         let out: Vec<Value> = hits.iter().enumerate().map(|(i, n)| Value::Object(n.to_json(Some(&format!("@{id}:e{}", i + 1))))).collect();
         if first {
